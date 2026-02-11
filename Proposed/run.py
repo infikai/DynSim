@@ -5,11 +5,10 @@ import argparse
 from scheduler import Scheduler
 from cluster_manager import ClusterManager
 from components import Job
-import time
 
-# --- NEW: Define Pool Sizes ---
-TRAINING_POOL_SIZE = 600
-INFERENCE_POOL_SIZE = 500
+# --- Define Total GPU Pool Size ---
+TOTAL_GPU_COUNT = 1000  # Single unified pool
+INFERENCE_PREEMPTION_THRESHOLD = 250  # Threshold for inference preemption rights
 
 def load_jobs_from_csv(file_path):
     """
@@ -80,11 +79,10 @@ if __name__ == "__main__":
     
     args = parser.parse_args()
 
-    print("🚀 Starting Split-Pool Simulation...")
+    print("🚀 Starting Unified Pool Simulation...")
     
-    # --- MODIFIED: Initialize Split Cluster ---
-    cluster = ClusterManager(num_training_gpus=TRAINING_POOL_SIZE, 
-                             num_inference_gpus=INFERENCE_POOL_SIZE)
+    # --- Initialize Unified Cluster ---
+    cluster = ClusterManager(total_gpus=TOTAL_GPU_COUNT)
     
     cluster.pre_warm_llm_servers()
     
