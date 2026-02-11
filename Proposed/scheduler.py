@@ -3,7 +3,7 @@ import math
 from collections import deque
 from components import SimulationClock, PREEMPTION_OVERHEAD
 
-INFERENCE_PREEMPTION_THRESHOLD = 250  # Threshold for inference preemption rights
+INFERENCE_PREEMPTION_THRESHOLD = 300  # Threshold for inference preemption rights
 
 class Scheduler:
     def __init__(self, jobs_list, cluster_manager, progress_interval=1000, log_interval=500, 
