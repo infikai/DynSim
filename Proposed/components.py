@@ -111,6 +111,7 @@ class Job:
         self.gpus_needed = 1
         self.last_preemption_time = -1
         self.ideal_duration = self.base_duration
+        self.is_checkpointed = False
         
         # Training jobs can be delayed indefinitely when preempted by inference
         if self.job_type == 'training':
@@ -148,6 +149,21 @@ class Job:
         self.assigned_gpus.append(gpu_to_add)
         self._distribute_load()
         self.paused_until = current_time + RECLAMATION_OVERHEAD - 4
+
+    def checkpoint_and_pause(self, gpu_to_release, current_time):
+        """Checkpoint a 1-GPU job: release the GPU, preserve remaining_work."""
+        self.last_preemption_time = current_time
+        gpu_to_release.release_task(self)
+        if gpu_to_release in self.assigned_gpus:
+            self.assigned_gpus.remove(gpu_to_release)
+        self.paused_until = current_time + PREEMPTION_OVERHEAD
+        self.is_checkpointed = True
+
+    def resume_from_checkpoint(self, gpu, current_time):
+        """Resume a checkpointed job on a new GPU with no extra overhead."""
+        self.assigned_gpus = [gpu]
+        self.is_checkpointed = False
+        self._distribute_load()
     
     def update_progress(self, time_delta, current_time):
         if not self.assigned_gpus or current_time < self.paused_until:
@@ -156,7 +172,7 @@ class Job:
         self.remaining_work -= (time_delta * speedup_factor)
 
     def can_be_preempted(self, current_time, estimated_borrow_time=1000.0):
-        if self.start_time == -1 or len(self.assigned_gpus) <= 1:
+        if self.start_time == -1:
             return False
         
         work_done = self.ideal_duration - self.remaining_work

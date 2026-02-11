@@ -76,10 +76,17 @@ class Scheduler:
                     v_job, v_gpu = self.cluster.find_training_job_to_preempt(self.clock.current_time)
                     
                     if v_job:
-                        v_job.preempt_and_pause(v_gpu, self.clock.current_time)
-                        self.preemption_map[v_gpu.gpu_id] = v_job
+                        if len(v_job.assigned_gpus) <= 1:
+                            # 1-GPU job: checkpoint and re-queue
+                            v_job.checkpoint_and_pause(v_gpu, self.clock.current_time)
+                            self.running_jobs.remove(v_job)
+                            self.jobs_to_retry.appendleft(v_job)
+                        else:
+                            # Multi-GPU job: borrow-and-return
+                            v_job.preempt_and_pause(v_gpu, self.clock.current_time)
+                            self.preemption_map[v_gpu.gpu_id] = v_job
                         self.preemption_count += 1
-                        v_gpu.convert_to_llm_server(drain_at_time=self.clock.current_time + 1000)
+                        v_gpu.convert_to_llm_server(drain_at_time=self.clock.current_time + 600)
                         gpu = v_gpu
                         gpu.reclamation_cooldown_timer = PREEMPTION_OVERHEAD
 
@@ -106,7 +113,10 @@ class Scheduler:
             immediate.append(g)
 
         if len(immediate) >= job.gpus_needed:
-            job.assign_resources(immediate[:job.gpus_needed], self.clock.current_time)
+            if job.is_checkpointed:
+                job.resume_from_checkpoint(immediate[0], self.clock.current_time)
+            else:
+                job.assign_resources(immediate[:job.gpus_needed], self.clock.current_time)
             self.running_jobs.append(job)
             return True
         return False
