@@ -7,8 +7,8 @@ from cluster_manager import ClusterManager
 from components import Job
 
 # --- Define Total GPU Pool Size ---
-TOTAL_GPU_COUNT = 1000  # Single unified pool
-INFERENCE_PREEMPTION_THRESHOLD = 250  # Threshold for inference preemption rights
+TOTAL_GPU_COUNT = 1100  # Single unified pool
+INFERENCE_PREEMPTION_THRESHOLD = 300  # Threshold for inference preemption rights
 
 def load_jobs_from_csv(file_path):
     """
