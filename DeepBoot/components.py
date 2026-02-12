@@ -116,7 +116,7 @@ class GPU:
         """Assigns a task. For Inference, state becomes RUN. For Training, TRAIN."""
         self.running_tasks[job.id] = {'job': job}
         
-        if job.job_type in ['inference', 'llm_inference']:
+        if job.job_type == 'llm_inference':
             self.state = 'RUN'
         else:
             self.state = 'TRAIN'
@@ -132,9 +132,7 @@ class GPU:
             if job.job_type == 'training':
                 self.available_memory += job.memory_required
     
-    def can_fit(self, job):
-        return (job.memory_required <= self.available_memory and
-                job.utilization_required <= self.available_utilization)
+
 
     def __repr__(self):
         return f"<GPU {self.gpu_id} ({self.gpu_type}) State={self.state} Tasks={len(self.running_tasks)}>"

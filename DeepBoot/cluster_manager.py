@@ -70,17 +70,7 @@ class ClusterManager:
                 
         return best_gpu
 
-    def find_gpu_for_stackable_inference(self, job):
-        for gpu in sorted(self.inference_gpus, key=lambda g: g.is_idle()):
-            if gpu.state == 'FREE' and gpu.can_fit(job):
-                return gpu
-        return None
 
-    def find_idle_gpus_in_inference_pool(self, count):
-        idle_gpus = [gpu for gpu in self.inference_gpus if gpu.is_idle()]
-        if len(idle_gpus) >= count:
-            return idle_gpus[:count]
-        return []
 
     def find_idle_gpus_for_training(self, count):
         idle_gpus = [gpu for gpu in self.training_gpus if gpu.is_idle()]

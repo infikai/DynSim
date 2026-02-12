@@ -99,8 +99,6 @@ class Scheduler:
     def _dispatch_job(self, job):
         if job.job_type == 'training':
             return self._dispatch_training_job(job)
-        elif job.job_type == 'inference':
-            return self._dispatch_inference_job(job)
         elif job.job_type == 'llm_inference':
             return self._dispatch_llm_inference_job(job)
         return False
@@ -292,38 +290,7 @@ class Scheduler:
             job.overhead_remaining += OVERHEAD_AFE_SYNC
             job.last_penalty_time = current_time
 
-    def _dispatch_inference_job(self, job):
-        is_large_job = (job.memory_required > GPU_MEMORY_GB or 
-                        job.utilization_required > GPU_UTILIZATION_PERCENT)
-        if is_large_job:
-            return self._dispatch_large_inference_job(job)
-        return self._dispatch_stackable_inference_job(job)
 
-    def _dispatch_stackable_inference_job(self, job):
-        job.gpus_needed = 1 
-        gpu = self.cluster.find_gpu_for_stackable_inference(job)
-        if gpu:
-            job.assign_resources([gpu], self.clock.current_time)
-            delay = max(0, job.start_time - job.arrival_time)
-            self.current_inference_delays.append(delay)
-            gpu.assign_task(job)
-            self.running_jobs.append(job)
-            return True
-        return False
-
-    def _dispatch_large_inference_job(self, job):
-        gpus_needed = job.gpus_needed
-        
-        allocated_gpus = self.cluster.find_idle_gpus_in_inference_pool(gpus_needed)
-        if len(allocated_gpus) == gpus_needed:
-            job.assign_resources(allocated_gpus, self.clock.current_time)
-            delay = max(0, job.start_time - job.arrival_time)
-            self.current_inference_delays.append(delay)
-            for gpu in allocated_gpus:
-                gpu.assign_task(job)
-            self.running_jobs.append(job)
-            return True
-        return False
         
     def _dispatch_training_job(self, job):
         desired_gpus = job.gpus_needed
@@ -470,7 +437,7 @@ class Scheduler:
                          f"{ideal_completion_time},{job.completion_time},{perf_factor:.4f},{len(freed_gpus)}\n")
             self.training_log_file.write(log_entry)
 
-        if job.job_type in ['inference', 'llm_inference']:
+        if job.job_type == 'llm_inference':
             for gpu in freed_gpus:
                 if gpu.gpu_type == 'inference':
                     if len(gpu.running_tasks) == 0:
@@ -534,7 +501,7 @@ class Scheduler:
 
             if self.clock.current_time >= next_scaling_check:
                 self._try_scale_up_training_jobs()
-                next_scaling_check = self.clock.current_time + 1800
+                next_scaling_check = self.clock.current_time + 900
 
             self._process_scaling_events()
 
