@@ -15,6 +15,7 @@ class Scheduler:
         self.clock = SimulationClock(tick_duration=tick_duration)
         self.preemption_count = 0
         self.reclamation_count = 0
+        self.checkpoint_requeue_count = 0
         self.preemption_map = {} 
         self.end_time_threshold = end_time_threshold
         self.jobs_to_retry = deque()
@@ -81,6 +82,7 @@ class Scheduler:
                             v_job.checkpoint_and_pause(v_gpu, self.clock.current_time)
                             self.running_jobs.remove(v_job)
                             self.jobs_to_retry.appendleft(v_job)
+                            self.checkpoint_requeue_count += 1
                         else:
                             # Multi-GPU job: borrow-and-return
                             v_job.preempt_and_pause(v_gpu, self.clock.current_time)
@@ -209,6 +211,7 @@ class Scheduler:
         print(f"\n⚡ Resource Management:")
         print(f"   Total Preemptions: {self.preemption_count}")
         print(f"   Total Reclamations: {self.reclamation_count}")
+        print(f"   1-GPU Checkpoint & Re-queues: {self.checkpoint_requeue_count}")
         
         if training_jobs:
             avg_training_tat = sum(j.turnaround_time for j in training_jobs) / len(training_jobs)
