@@ -32,6 +32,7 @@ class Scheduler:
         self.deadline_violations = 0
         self.preemption_blocked_count = 0
         self.preemption_map = {}  # gpu_id -> training_job (borrow-and-return tracking)
+        self.pending_return_events = []  # GPU return-to-training events with 140s init delay
 
         self.training_log_file = open("training_job_log.csv", "w")
         self.inference_delay_log_file = open("inference_delay_log.csv", "w")
@@ -341,6 +342,28 @@ class Scheduler:
         return False
 
 
+    def _process_return_events(self):
+        """Process pending GPU return-to-training events (140s init delay)."""
+        for event in list(self.pending_return_events):
+            event['time_left'] -= self.clock.tick_duration
+            
+            if event['time_left'] <= 0:
+                job = event['job']
+                gpu = event['gpu']
+                
+                if job not in self.running_jobs:
+                    # Training job already finished, GPU stays FREE
+                    gpu.state = 'FREE'
+                    gpu.usage_count = 0
+                    self.pending_return_events.remove(event)
+                    continue
+                
+                # Return GPU to training job
+                gpu.state = 'TRAIN'
+                gpu.assign_task(job)
+                job.assigned_gpus.append(gpu)
+                job.overhead_remaining += OVERHEAD_AFE_SYNC
+                self.pending_return_events.remove(event)
 
     def _handle_job_completion(self, job):
 
@@ -370,12 +393,13 @@ class Scheduler:
                             gpu.state = 'FREE'
                             gpu.drain_at_time = -1
                             gpu.usage_count = 0
-                            # Re-assign GPU to training job if it's still running
+                            # Schedule GPU return with 140s init delay
                             if reclaimer in self.running_jobs:
-                                gpu.state = 'TRAIN'
-                                gpu.assign_task(reclaimer)
-                                reclaimer.assigned_gpus.append(gpu)
-                                reclaimer.overhead_remaining += OVERHEAD_AFE_SYNC
+                                self.pending_return_events.append({
+                                    'job': reclaimer,
+                                    'gpu': gpu,
+                                    'time_left': 140
+                                })
                                 self.reclamation_count += 1
                         else:
                             gpu.state = 'PROTECT'
@@ -433,6 +457,7 @@ class Scheduler:
             for gpu in self.cluster.inference_gpus:
                 gpu.update_lifecycle(self.clock.tick_duration)
 
+            self._process_return_events()
 
             if self.clock.current_time >= self.next_delay_log_time:
                 self._log_average_inference_delay()

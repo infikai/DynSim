@@ -8,7 +8,7 @@ import math
 
 GPU_MEMORY_GB = 32
 GPU_UTILIZATION_PERCENT = 100
-LLM_MAX_CONCURRENCY = 15       # Max LLM slots per GPU
+LLM_MAX_CONCURRENCY = 16       # Max LLM slots per GPU
 
 # LLM Performance Model Constants
 LLM_BASE_TTFT = 2.5          # Base time to first token
