@@ -14,9 +14,14 @@ class ClusterManager:
         
         Args:
             can_preempt_fn: Optional callback(job, gpu) -> bool to check deadline constraints
+        
+        Returns:
+            (best_gpu, deadline_blocked_count) - best_gpu is None if no target found,
+            deadline_blocked_count is how many candidates were skipped due to deadlines.
         """
         best_gpu = None
         min_loss = float('inf')
+        deadline_blocked = 0
 
         # Only look at GPUs currently loaned to training
         loaned_gpus = [g for g in self.inference_gpus if g.state == 'TRAIN']
@@ -29,6 +34,7 @@ class ClusterManager:
             
             # Check deadline constraint
             if can_preempt_fn and not can_preempt_fn(job, gpu):
+                deadline_blocked += 1
                 continue  # Skip this GPU, preemption would violate deadline
             
             current_gpus = len(job.assigned_gpus)
@@ -44,7 +50,7 @@ class ClusterManager:
                 min_loss = loss
                 best_gpu = gpu
                 
-        return best_gpu
+        return best_gpu, deadline_blocked
 
     def release_resources_for_job(self, job):
         for gpu in job.assigned_gpus:

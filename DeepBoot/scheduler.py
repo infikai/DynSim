@@ -168,13 +168,15 @@ class Scheduler:
 
         # === Phase 3: Reclaim from Training (preemption) ===
         while remaining:
-            gpu = self.cluster.find_reclaim_target(
+            gpu, deadline_blocked = self.cluster.find_reclaim_target(
                 can_preempt_fn=lambda j, g: self._can_preempt_without_deadline_miss(
                     j, g, self.clock.current_time
                 )
             )
             
             if not gpu:
+                if deadline_blocked > 0:
+                    self.preemption_blocked_count += deadline_blocked
                 break  # No preemptable targets, fall through to Phase 4
 
             # 1. Preempt Training Job
@@ -227,8 +229,6 @@ class Scheduler:
                 self._assign_jobs_to_gpu(gpu, remaining, OVERHEAD_COLD_START)
 
         # Anything still remaining could not be assigned
-        if remaining:
-            self.preemption_blocked_count += len(remaining)
         return list(remaining)
 
     def _preempt_training_job(self, job, gpu):

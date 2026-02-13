@@ -85,7 +85,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     # Calculate GPU split
-    num_training = 700
+    num_training = 650
     num_inference = 650
     
     print(f"Initializing cluster: {num_training} training GPUs, {num_inference} inference GPUs (Total: {args.total_gpus})")
