@@ -57,16 +57,10 @@ class Scheduler:
         for gpu in self.cluster.inference_gpus:
             if gpu.state == 'PROTECT':
                 protect_gpus_count += 1
-
-            if gpu.is_llm_server:
+            elif gpu.state == 'RUN':
                 inference_gpus_used += 1
-            elif not gpu.is_idle():
-                inference_gpus_used += 1
-                for task in gpu.running_tasks.values():
-                    if task['job'].job_type == 'training':
-                         borrowed_gpus_used += 1
-                         inference_gpus_used -= 1
-                         break
+            elif gpu.state == 'TRAIN':
+                borrowed_gpus_used += 1
         
         self.usage_log_file.write(f"{self.clock.current_time},{training_gpus_used},{inference_gpus_used},{borrowed_gpus_used},{protect_gpus_count}\n")
     
@@ -89,8 +83,8 @@ class Scheduler:
         gpus_after_preempt = current_gpus - 1
         
         if gpus_after_preempt <= 0:
-            # 1-GPU job: would be fully paused for ~600s, then resume
-            pause_penalty = ESTIMATED_BORROW_TIME + OVERHEAD_AFE_SYNC
+            # 1-GPU job: would be fully paused for ~600s + 140s init, then resume
+            pause_penalty = ESTIMATED_BORROW_TIME + 140 + OVERHEAD_AFE_SYNC
             speedup = job.calculate_speedup(1)
             estimated_remaining_time = remaining_work / speedup if speedup > 0 else float('inf')
             estimated_completion = current_time + pause_penalty + estimated_remaining_time
@@ -118,8 +112,6 @@ class Scheduler:
     def _dispatch_job(self, job):
         if job.job_type == 'training':
             return self._dispatch_training_job(job)
-        elif job.job_type == 'llm_inference':
-            return self._dispatch_llm_inference_job(job)
         return False
     
     def _assign_jobs_to_gpu(self, gpu, jobs_deque, base_overhead, max_slots=None):
@@ -239,59 +231,6 @@ class Scheduler:
             self.preemption_blocked_count += len(remaining)
         return list(remaining)
 
-    def _dispatch_llm_inference_job(self, job):
-        gpu = self.cluster.find_gpu_for_llm_job()
-        
-        if gpu:
-            base_overhead = OVERHEAD_WARM_START
-            if gpu.state == 'FREE':
-                base_overhead = OVERHEAD_COLD_START
-                gpu.convert_to_llm_server()
-            else:
-                if gpu.state == 'PROTECT':
-                    gpu.usage_count += 1
-
-            job.assigned_gpus = [gpu]
-            
-            wait_time = gpu.reclaim_time_remaining
-            job.start_time = self.clock.current_time + wait_time
-            job.overhead_remaining = base_overhead
-
-            delay = max(0, job.start_time - job.arrival_time)
-            self.current_inference_delays.append(delay)
-            
-            gpu.assign_llm_task(job)
-            self.running_jobs.append(job)
-            return True
-        
-        # NEW: Pass deadline check to find_reclaim_target
-        gpu = self.cluster.find_reclaim_target(
-            can_preempt_fn=lambda j, g: self._can_preempt_without_deadline_miss(
-                j, g, self.clock.current_time
-            )
-        )
-        if gpu:
-            if gpu.running_tasks:
-                training_job = list(gpu.running_tasks.values())[0]['job']
-                self._preempt_training_job(training_job, gpu)
-
-            gpu.start_reclaim()
-
-            job.start_time = self.clock.current_time + OVERHEAD_RECLAIM
-            job.overhead_remaining = OVERHEAD_WARM_START
-            job.assigned_gpus = [gpu]
-            
-            delay = max(0, job.start_time - job.arrival_time)
-            self.current_inference_delays.append(delay)
-            
-            gpu.assign_llm_task(job)
-            self.running_jobs.append(job)
-            return True
-        
-        # No GPU available and preemption blocked by deadlines
-        self.preemption_blocked_count += 1
-        return False
-
     def _preempt_training_job(self, job, gpu):
         gpu.release_task(job)
         if gpu in job.assigned_gpus:
@@ -310,7 +249,6 @@ class Scheduler:
         
     def _dispatch_training_job(self, job):
         desired_gpus = job.gpus_needed
-        min_gpus = 1 
 
         assigned_gpus = []
 
@@ -333,7 +271,6 @@ class Scheduler:
             job.assign_resources(assigned_gpus, self.clock.current_time)
             for gpu in assigned_gpus:
                 if gpu.gpu_type == 'inference':
-                    gpu.state = 'TRAIN'
                     gpu.protect_time_remaining = 0
                 gpu.assign_task(job)
                 
@@ -352,14 +289,13 @@ class Scheduler:
                 gpu = event['gpu']
                 
                 if job not in self.running_jobs:
-                    # Training job already finished, GPU stays FREE
+                    # Training job already finished, GPU goes FREE
                     gpu.state = 'FREE'
                     gpu.usage_count = 0
                     self.pending_return_events.remove(event)
                     continue
                 
                 # Return GPU to training job
-                gpu.state = 'TRAIN'
                 gpu.assign_task(job)
                 job.assigned_gpus.append(gpu)
                 job.overhead_remaining += OVERHEAD_AFE_SYNC
@@ -395,6 +331,7 @@ class Scheduler:
                             gpu.usage_count = 0
                             # Schedule GPU return with 140s init delay
                             if reclaimer in self.running_jobs:
+                                gpu.state = 'TRAIN'  # Mark as TRAIN so it's not stolen during init
                                 self.pending_return_events.append({
                                     'job': reclaimer,
                                     'gpu': gpu,
@@ -448,7 +385,7 @@ class Scheduler:
         self.next_delay_log_time = ( (effective_start_time // self.delay_log_interval) + 1 ) * self.delay_log_interval
         self.jobs_to_retry = deque()
 
-        while self.pending_jobs or self.running_jobs or self.jobs_to_retry:
+        while self.pending_jobs or self.running_jobs or self.jobs_to_retry or self.pending_return_events:
             if self.end_time != -1 and self.clock.current_time >= self.end_time:
                 break
             
@@ -502,6 +439,8 @@ class Scheduler:
                 if job.is_complete(): finished.append(job)
             
             for job in finished: self._handle_job_completion(job)
+
+        self.print_results()
 
     def print_results(self):
         self._log_average_inference_delay()
