@@ -45,6 +45,7 @@ class GPU:
         self.protect_time_remaining = 0
         self.reclaim_time_remaining = 0 # Tracks switch delay
         self.usage_count = 0  
+        self.drain_at_time = -1  # When set, GPU stops accepting new LLM tasks after this time
         
         self.total_memory = GPU_MEMORY_GB
         self.total_utilization = GPU_UTILIZATION_PERCENT
@@ -78,6 +79,14 @@ class GPU:
     def is_llm_server(self):
         return self.state in ['RUN', 'PROTECT']
     
+    def is_draining(self, current_time=None):
+        """Check if this GPU is past its drain time and should not accept new LLM tasks."""
+        if self.drain_at_time == -1:
+            return False
+        if current_time is not None:
+            return current_time >= self.drain_at_time
+        return False
+
     @property
     def llm_slots_available(self):
         if self.state == 'RUN':
@@ -101,11 +110,12 @@ class GPU:
             return True
         return False
     
-    def start_reclaim(self):
+    def start_reclaim(self, drain_at_time=-1):
         """Triggers the reclaim overhead timer."""
         self.state = 'RUN'
         self.reclaim_time_remaining = OVERHEAD_RECLAIM
         self.usage_count = 0
+        self.drain_at_time = drain_at_time
 
     def calculate_protection_time(self):
         """DeepBoot Formula: t_p = t_p,min + g.cnt * interval"""

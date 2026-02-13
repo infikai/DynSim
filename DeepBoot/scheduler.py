@@ -16,7 +16,7 @@ class Scheduler:
         self.preemption_count = 0
         self.reclamation_count = 0
 
-        self.pending_scaling_events = []
+
 
         self.progress_interval = progress_interval
         self.log_interval = log_interval
@@ -31,6 +31,7 @@ class Scheduler:
         self.deadline_map = deadline_map or {}
         self.deadline_violations = 0
         self.preemption_blocked_count = 0
+        self.preemption_map = {}  # gpu_id -> training_job (borrow-and-return tracking)
 
         self.training_log_file = open("training_job_log.csv", "w")
         self.inference_delay_log_file = open("inference_delay_log.csv", "w")
@@ -71,29 +72,46 @@ class Scheduler:
     def _can_preempt_without_deadline_miss(self, job, gpu, current_time):
         """
         Check if preempting this job would cause it to miss its deadline.
+        Uses a 600-second estimated inference borrow time for calculations.
         
         Returns True if safe to preempt, False if would miss deadline.
         """
+        ESTIMATED_BORROW_TIME = 600  # Expected inference running time on the borrowed GPU
+
         if job.id not in self.deadline_map:
             return True  # No deadline constraint, allow preemption
         
         deadline = self.deadline_map[job.id]
         
-        # Estimate remaining time if preempted
         remaining_work = job.remaining_work
         current_gpus = len(job.assigned_gpus)
         gpus_after_preempt = current_gpus - 1
         
         if gpus_after_preempt <= 0:
-            # Would completely stop the job
-            return False
+            # 1-GPU job: would be fully paused for ~600s, then resume
+            pause_penalty = ESTIMATED_BORROW_TIME + OVERHEAD_AFE_SYNC
+            speedup = job.calculate_speedup(1)
+            estimated_remaining_time = remaining_work / speedup if speedup > 0 else float('inf')
+            estimated_completion = current_time + pause_penalty + estimated_remaining_time
+            return estimated_completion <= deadline
         
-        # Estimate completion time after preemption
-        speedup_after = job.calculate_speedup(gpus_after_preempt)
-        estimated_remaining_time = remaining_work / speedup_after if speedup_after > 0 else float('inf')
+        # Multi-GPU job: runs slower with one fewer GPU for ~600s, then gets it back
+        speedup_reduced = job.calculate_speedup(gpus_after_preempt)
+        speedup_full = job.calculate_speedup(current_gpus)
+        
+        # Work done during the borrow period at reduced speed
+        work_during_borrow = ESTIMATED_BORROW_TIME * speedup_reduced
+        work_after_borrow = remaining_work - work_during_borrow
+        
+        if work_after_borrow <= 0:
+            # Job finishes during the borrow period
+            estimated_remaining_time = remaining_work / speedup_reduced if speedup_reduced > 0 else float('inf')
+        else:
+            # Borrow period + init_time before GPU returns + remaining at full speed
+            init_time = 140
+            estimated_remaining_time = ESTIMATED_BORROW_TIME + init_time + (work_after_borrow / speedup_full if speedup_full > 0 else float('inf'))
+        
         estimated_completion = current_time + estimated_remaining_time + OVERHEAD_AFE_SYNC
-        
-        # Allow preemption only if estimated completion <= deadline
         return estimated_completion <= deadline
     
     def _dispatch_job(self, job):
@@ -103,125 +121,122 @@ class Scheduler:
             return self._dispatch_llm_inference_job(job)
         return False
     
+    def _assign_jobs_to_gpu(self, gpu, jobs_deque, base_overhead, max_slots=None):
+        """Helper: assign as many jobs from jobs_deque to gpu as slots allow.
+        Skips GPUs that are draining (past drain_at_time).
+        Returns the number of jobs assigned."""
+        # Don't assign new LLM tasks to a GPU that is draining back to training
+        if gpu.is_draining(self.clock.current_time):
+            return 0
+        
+        slots = max_slots if max_slots is not None else gpu.llm_slots_available
+        count = 0
+        
+        while slots > 0 and jobs_deque:
+            job = jobs_deque.popleft()
+            job.assigned_gpus = [gpu]
+            
+            wait_time = gpu.reclaim_time_remaining
+            job.start_time = self.clock.current_time + wait_time
+            job.overhead_remaining = base_overhead
+
+            delay = math.floor(max(0, job.start_time - job.arrival_time))
+            if delay > 0:
+                self.current_inference_delays.append(delay)
+            
+            gpu.assign_llm_task(job)
+            self.running_jobs.append(job)
+            count += 1
+            slots -= 1
+        
+        return count
+
     def _batch_dispatch_llm_jobs(self, llm_jobs):
         if not llm_jobs:
             return []
 
-        # === Phase 1: Try Warm/Cold GPUs ===
-        num_jobs_to_assign = len(llm_jobs)
-        available_gpus, _ = self.cluster.find_resources_for_llm_batch(num_jobs_to_assign)
-        
-        assigned_count = 0
-        job_index = 0
-        
-        for gpu in available_gpus:
-            if job_index >= num_jobs_to_assign:
-                break 
+        remaining = deque(llm_jobs)
 
-            base_overhead = OVERHEAD_WARM_START
-            if gpu.state == 'FREE':
-                base_overhead = OVERHEAD_COLD_START
+        # === Phase 1: RUN GPUs (active LLM servers with open slots) ===
+        for gpu in self.cluster.inference_gpus:
+            if not remaining:
+                break
+            if gpu.state == 'RUN' and gpu.llm_slots_available > 0 and not gpu.is_draining(self.clock.current_time):
+                self._assign_jobs_to_gpu(gpu, remaining, OVERHEAD_WARM_START)
 
-            slots_to_fill = 0
-            if not gpu.is_llm_server:
+        # === Phase 2: PROTECT GPUs (warm but idle, fast to reuse) ===
+        for gpu in self.cluster.inference_gpus:
+            if not remaining:
+                break
+            if gpu.state == 'PROTECT':
+                gpu.usage_count += 1
+                gpu.state = 'RUN'
+                self._assign_jobs_to_gpu(gpu, remaining, OVERHEAD_WARM_START)
+
+        # === Phase 3: Reclaim from Training (preemption) ===
+        while remaining:
+            gpu = self.cluster.find_reclaim_target(
+                can_preempt_fn=lambda j, g: self._can_preempt_without_deadline_miss(
+                    j, g, self.clock.current_time
+                )
+            )
+            
+            if not gpu:
+                break  # No preemptable targets, fall through to Phase 4
+
+            # 1. Preempt Training Job
+            if gpu.running_tasks:
+                training_job = list(gpu.running_tasks.values())[0]['job']
+                self._preempt_training_job(training_job, gpu)
+                self.preemption_map[gpu.gpu_id] = training_job
+
+            # 2. Start Physical Reclaim Timer with 600s drain
+            gpu.start_reclaim(drain_at_time=self.clock.current_time + 600)
+            self.preemption_count += 1
+
+            # 3. Assign Leader + fill remaining slots
+            leader = remaining.popleft()
+            leader.start_time = self.clock.current_time + OVERHEAD_RECLAIM
+            leader.overhead_remaining = OVERHEAD_WARM_START
+            leader.assigned_gpus = [gpu]
+            
+            delay = math.floor(max(0, leader.start_time - leader.arrival_time))
+            if delay > 0:
+                self.current_inference_delays.append(delay)
+
+            gpu.assign_llm_task(leader)
+            self.running_jobs.append(leader)
+
+            # Fill remaining slots on this GPU
+            slots_remaining = LLM_MAX_CONCURRENCY - 1
+            while slots_remaining > 0 and remaining:
+                follower = remaining.popleft()
+                follower.start_time = self.clock.current_time + OVERHEAD_RECLAIM
+                follower.overhead_remaining = OVERHEAD_WARM_START
+                follower.assigned_gpus = [gpu]
+                
+                delay_f = math.floor(max(0, follower.start_time - follower.arrival_time))
+                if delay_f > 0:
+                    self.current_inference_delays.append(delay_f)
+                
+                gpu.assign_llm_task(follower)
+                self.running_jobs.append(follower)
+                slots_remaining -= 1
+
+        # === Phase 4: FREE GPUs (cold start, last resort) ===
+        for gpu in self.cluster.inference_gpus:
+            if not remaining:
+                break
+            if gpu.is_idle():  # state == 'FREE' and no tasks
                 was_converted = gpu.convert_to_llm_server()
                 if not was_converted:
-                    continue 
-                slots_to_fill = gpu.llm_slots_available
-            else:
-                slots_to_fill = gpu.llm_slots_available
-                
-            for _ in range(slots_to_fill):
-                if job_index >= num_jobs_to_assign:
-                    break 
-                
-                job = llm_jobs[job_index]
-                job.assigned_gpus = [gpu]
-                
-                wait_time = gpu.reclaim_time_remaining
-                job.start_time = self.clock.current_time + wait_time
-                job.overhead_remaining = base_overhead
+                    continue
+                self._assign_jobs_to_gpu(gpu, remaining, OVERHEAD_COLD_START)
 
-                delay = math.floor(max(0, job.start_time - job.arrival_time))
-                if delay > 0:
-                    self.current_inference_delays.append(delay)
-                
-                gpu.assign_llm_task(job) 
-                self.running_jobs.append(job)
-                
-                assigned_count += 1
-                job_index += 1
-
-        # === Phase 2: Try Reclaiming (Preemption) ===
-        if assigned_count < num_jobs_to_assign:
-            remaining_jobs = deque(llm_jobs[assigned_count:])
-            still_unassigned = []
-
-            while remaining_jobs:
-                # Get the first job ("Leader")
-                job_leader = remaining_jobs.popleft()
-                
-                # NEW: Pass deadline check to find_reclaim_target
-                gpu = self.cluster.find_reclaim_target(
-                    can_preempt_fn=lambda j, g: self._can_preempt_without_deadline_miss(
-                        j, g, self.clock.current_time
-                    )
-                )
-                
-                
-                if gpu:
-                    # 1. Preempt Training Job
-                    if gpu.running_tasks:
-                        training_job = list(gpu.running_tasks.values())[0]['job']
-                        self._preempt_training_job(training_job, gpu)
-
-                    # 2. Start Physical Reclaim Timer
-                    gpu.start_reclaim()
-                    self.preemption_count += 1
-
-                    # 3. Assign the Leader Job
-                    # Wait for reclaim (Delay) + Warm Start Overhead
-                    job_leader.start_time = self.clock.current_time + OVERHEAD_RECLAIM
-                    job_leader.overhead_remaining = OVERHEAD_WARM_START
-                    job_leader.assigned_gpus = [gpu]
-                    
-                    delay = math.floor(max(0, job_leader.start_time - job_leader.arrival_time))
-                    if delay > 0:
-                        self.current_inference_delays.append(delay)
-
-                    gpu.assign_llm_task(job_leader)
-                    self.running_jobs.append(job_leader)
-
-                    # --- FIX: FILL REMAINING SLOTS IMMEDIATELY ---
-                    # We just paid a huge penalty to open this GPU. Fill it up!
-                    slots_remaining = LLM_MAX_CONCURRENCY - 1
-                    
-                    while slots_remaining > 0 and remaining_jobs:
-                        job_follower = remaining_jobs.popleft()
-                        
-                        # Followers share the EXACT SAME wait conditions as the leader
-                        job_follower.start_time = self.clock.current_time + OVERHEAD_RECLAIM
-                        job_follower.overhead_remaining = OVERHEAD_WARM_START
-                        job_follower.assigned_gpus = [gpu]
-                        
-                        delay_f = math.floor(max(0, job_follower.start_time - job_follower.arrival_time))
-                        if delay_f > 0:
-                            self.current_inference_delays.append(delay_f)
-                        
-                        gpu.assign_llm_task(job_follower)
-                        self.running_jobs.append(job_follower)
-                        slots_remaining -= 1
-
-                else:
-                    # No reclaim targets left (or all blocked by deadlines)
-                    self.preemption_blocked_count += 1
-                    still_unassigned.append(job_leader)
-                    still_unassigned.extend(remaining_jobs)
-                    break
-            
-            return still_unassigned
-
-        return []
+        # Anything still remaining could not be assigned
+        if remaining:
+            self.preemption_blocked_count += len(remaining)
+        return list(remaining)
 
     def _dispatch_llm_inference_job(self, job):
         gpu = self.cluster.find_gpu_for_llm_job()
@@ -325,101 +340,9 @@ class Scheduler:
             return True
         return False
 
-    def _try_scale_up_training_jobs(self):
-        # If no GPUs are idle, don't bother checking if jobs want to scale.
-        # This saves millions of loop iterations when the cluster is full.
-        
-        # Check quickly if we have ANY free resources
-        has_idle_training = any(g.is_idle() for g in self.cluster.training_gpus)
-        has_idle_inference = any(g.is_idle() for g in self.cluster.inference_gpus)
-        
-        if not has_idle_training and not has_idle_inference:
-            return
 
-        for job in self.running_jobs:
-            if job.job_type == 'training':
-                
-                is_already_scaling = any(evt['job'] == job for evt in self.pending_scaling_events)
-                if is_already_scaling:
-                    continue
-
-                current_count = len(job.assigned_gpus)
-                desired = job.gpus_needed
-                
-                if current_count < desired:
-                    needed = 1
-                    newly_acquired = []
-
-                    for gpu in self.cluster.training_gpus:
-                        if gpu.is_idle():
-                            newly_acquired.append(gpu)
-                            if len(newly_acquired) == needed: break
-                    
-                    if len(newly_acquired) < needed:
-                        remaining = needed - len(newly_acquired)
-                        for gpu in self.cluster.inference_gpus:
-                            if gpu.is_idle():
-                                newly_acquired.append(gpu)
-                                if len(newly_acquired) >= remaining: break
-                        if len(newly_acquired) > needed:
-                            newly_acquired = newly_acquired[:needed]
-
-                    if newly_acquired:
-                        for gpu in newly_acquired:
-                             if gpu.gpu_type == 'inference':
-                                gpu.state = 'TRAIN'
-                                gpu.protect_time_remaining = 0
-                        
-                        if desired > 16:
-                            init_time = 140
-                        else:
-                            init_time = 40
-                        
-                        self.pending_scaling_events.append({
-                            'job': job,
-                            'new_gpus': newly_acquired,
-                            'time_left': init_time
-                        })
-
-    def _process_scaling_events(self):
-        for event in list(self.pending_scaling_events):
-            event['time_left'] -= self.clock.tick_duration
-            
-            if event['time_left'] <= 0:
-                job = event['job']
-                new_gpus = event['new_gpus']
-                
-                if job not in self.running_jobs:
-                    for gpu in new_gpus:
-                        if gpu.gpu_type == 'inference':
-                            gpu.state = 'FREE'
-                    self.pending_scaling_events.remove(event)
-                    continue
-
-                old_gpus = list(job.assigned_gpus)
-                for gpu in old_gpus: 
-                    gpu.release_task(job)
-                
-                all_gpus = old_gpus + new_gpus
-                job.assign_resources(all_gpus, job.start_time)
-                
-                for gpu in all_gpus:
-                    if gpu.gpu_type == 'inference':
-                        gpu.state = 'TRAIN'
-                    gpu.assign_task(job)
-                
-                job.overhead_remaining += OVERHEAD_AFE_SYNC
-                self.reclamation_count += 1
-                self.pending_scaling_events.remove(event)
 
     def _handle_job_completion(self, job):
-        for event in list(self.pending_scaling_events):
-            if event['job'] == job:
-                for gpu in event['new_gpus']:
-                    if gpu.gpu_type == 'inference':
-                        gpu.state = 'FREE'
-                        gpu.usage_count = 0
-                self.pending_scaling_events.remove(event)
 
         freed_gpus = list(job.assigned_gpus)
         self.cluster.release_resources_for_job(job) 
@@ -441,8 +364,22 @@ class Scheduler:
             for gpu in freed_gpus:
                 if gpu.gpu_type == 'inference':
                     if len(gpu.running_tasks) == 0:
-                        gpu.state = 'PROTECT'
-                        gpu.protect_time_remaining = gpu.calculate_protection_time()
+                        # Check if this GPU should return to a preempted training job
+                        if gpu.gpu_id in self.preemption_map:
+                            reclaimer = self.preemption_map.pop(gpu.gpu_id)
+                            gpu.state = 'FREE'
+                            gpu.drain_at_time = -1
+                            gpu.usage_count = 0
+                            # Re-assign GPU to training job if it's still running
+                            if reclaimer in self.running_jobs:
+                                gpu.state = 'TRAIN'
+                                gpu.assign_task(reclaimer)
+                                reclaimer.assigned_gpus.append(gpu)
+                                reclaimer.overhead_remaining += OVERHEAD_AFE_SYNC
+                                self.reclamation_count += 1
+                        else:
+                            gpu.state = 'PROTECT'
+                            gpu.protect_time_remaining = gpu.calculate_protection_time()
                     else:
                         gpu.state = 'RUN'
         
@@ -487,9 +424,6 @@ class Scheduler:
         self.next_delay_log_time = ( (effective_start_time // self.delay_log_interval) + 1 ) * self.delay_log_interval
         self.jobs_to_retry = deque()
 
-        # 1. Initialize the timer for scaling
-        next_scaling_check = self.clock.current_time
-
         while self.pending_jobs or self.running_jobs or self.jobs_to_retry:
             if self.end_time != -1 and self.clock.current_time >= self.end_time:
                 break
@@ -499,11 +433,6 @@ class Scheduler:
             for gpu in self.cluster.inference_gpus:
                 gpu.update_lifecycle(self.clock.tick_duration)
 
-            if self.clock.current_time >= next_scaling_check:
-                self._try_scale_up_training_jobs()
-                next_scaling_check = self.clock.current_time + 900
-
-            self._process_scaling_events()
 
             if self.clock.current_time >= self.next_delay_log_time:
                 self._log_average_inference_delay()
