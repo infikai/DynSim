@@ -326,18 +326,27 @@ class Scheduler:
                         # Check if this GPU should return to a preempted training job
                         if gpu.gpu_id in self.preemption_map:
                             reclaimer = self.preemption_map.pop(gpu.gpu_id)
-                            gpu.state = 'FREE'
                             gpu.drain_at_time = -1
-                            gpu.usage_count = 0
                             # Schedule GPU return with 140s init delay
                             if reclaimer in self.running_jobs:
                                 gpu.state = 'TRAIN'  # Mark as TRAIN so it's not stolen during init
+                                gpu.usage_count = 0
                                 self.pending_return_events.append({
                                     'job': reclaimer,
                                     'gpu': gpu,
                                     'time_left': 140
                                 })
                                 self.reclamation_count += 1
+                                # Compensate: put one FREE inference GPU into PROTECT
+                                for inf_gpu in self.cluster.inference_gpus:
+                                    if inf_gpu.is_idle():
+                                        inf_gpu.state = 'PROTECT'
+                                        inf_gpu.protect_time_remaining = inf_gpu.calculate_protection_time()
+                                        break
+                            else:
+                                # Training job already finished, go to PROTECT
+                                gpu.state = 'PROTECT'
+                                gpu.protect_time_remaining = gpu.calculate_protection_time()
                         else:
                             gpu.state = 'PROTECT'
                             gpu.protect_time_remaining = gpu.calculate_protection_time()
