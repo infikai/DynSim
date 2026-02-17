@@ -3,8 +3,8 @@
 # --- Global Constants ---
 GPU_MEMORY_GB = 32
 GPU_UTILIZATION_PERCENT = 100
-PREEMPTION_OVERHEAD = 2
-RECLAMATION_OVERHEAD = 3
+PREEMPTION_OVERHEAD = 3
+RECLAMATION_OVERHEAD = 4
 PREEMPTION_COOLDOWN = 600
 LLM_POLICY_INTERVAL = 10 
 
@@ -38,7 +38,8 @@ class GPU:
         
         # --- NEW: Add drain timer attribute ---
         self.drain_at_time = -1 
-        
+        self.switch_time_remaining = 0  # Tracks GPU context switch overhead
+
         self.running_tasks = {}
 
     def can_fit(self, job):
@@ -65,7 +66,8 @@ class GPU:
         self.llm_slots_available = LLM_MAX_CONCURRENCY
         
         self.drain_at_time = drain_at_time
-        
+        self.switch_time_remaining = PREEMPTION_OVERHEAD
+
         self.available_memory = 0
         self.available_utilization = 0
         return True
@@ -79,7 +81,8 @@ class GPU:
         self.llm_slots_available = 0
         
         self.drain_at_time = -1
-        
+        self.switch_time_remaining = 0
+
         self.available_memory = self.total_memory
         self.available_utilization = self.total_utilization
         return True
@@ -96,6 +99,13 @@ class GPU:
             return False 
             
         return True 
+
+    def update_lifecycle(self, tick_duration):
+        """Tick down the switch overhead timer."""
+        if self.switch_time_remaining > 0:
+            self.switch_time_remaining -= tick_duration
+            if self.switch_time_remaining < 0:
+                self.switch_time_remaining = 0
 
     def assign_llm_task(self, job):
         if not self.is_llm_server or self.llm_slots_available <= 0:
@@ -219,6 +229,10 @@ class Job:
     def update_progress(self, time_delta, current_time):
         """Updates remaining work using a normalized speedup factor."""
         if not self.assigned_gpus or current_time < self.paused_until:
+            return
+        
+        # Don't progress if waiting for GPU switch overhead
+        if self.start_time > current_time:
             return
         
         if self.gpus_needed > 0:

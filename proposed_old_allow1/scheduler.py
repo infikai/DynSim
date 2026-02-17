@@ -29,14 +29,21 @@ class Scheduler:
 
         self.end_time_threshold = end_time_threshold
 
+        # Inference delay tracking
+        self.delay_log_interval = 600
+        self.next_delay_log_time = 0
+        self.current_inference_delays = []
+
         # Initialize log files
         self.training_log_file = open("training_job_log.csv", "w")
+        self.inference_delay_log_file = open("inference_delay_log.csv", "w")
         self.usage_log_file = open("gpu_usage_log.csv", "w")
         self._initialize_logs()
 
     def _initialize_logs(self):
         """Writes headers to the log files."""
         self.training_log_file.write("job_id,arrival_time,base_duration,ideal_completion_time,actual_completion_time,performance_factor,gpus\n")
+        self.inference_delay_log_file.write("timestamp,average_delay_seconds,job_count\n")
         self.usage_log_file.write("timestamp,training_gpus_used,inference_gpus_used,llm_servers_total,llm_servers_busy\n")
 
     def _log_gpu_usage(self):
@@ -95,7 +102,10 @@ class Scheduler:
                 if not jobs_to_assign: break
                 job = jobs_to_assign.popleft()
                 job.assigned_gpus = [gpu]
-                job.start_time = self.clock.current_time
+                job.start_time = self.clock.current_time + gpu.switch_time_remaining
+                delay = math.floor(max(0, job.start_time - job.arrival_time))
+                if delay > 0:
+                    self.current_inference_delays.append(delay)
                 gpu.assign_llm_task(job)
                 self.running_jobs.append(job)
             if not jobs_to_assign: break
@@ -134,7 +144,10 @@ class Scheduler:
                     if not jobs_to_assign: break
                     job = jobs_to_assign.popleft()
                     job.assigned_gpus = [victim_gpu]
-                    job.start_time = self.clock.current_time
+                    job.start_time = self.clock.current_time + PREEMPTION_OVERHEAD
+                    delay = math.floor(max(0, job.start_time - job.arrival_time))
+                    if delay > 0:
+                        self.current_inference_delays.append(delay)
                     victim_gpu.assign_llm_task(job) 
                     self.running_jobs.append(job)
         
@@ -162,6 +175,9 @@ class Scheduler:
                 job = jobs_to_assign.popleft()
                 job.assigned_gpus = [gpu_to_convert]
                 job.start_time = self.clock.current_time
+                delay = math.floor(max(0, job.start_time - job.arrival_time))
+                if delay > 0:
+                    self.current_inference_delays.append(delay)
                 gpu_to_convert.assign_llm_task(job) 
                 self.running_jobs.append(job)
 
@@ -196,6 +212,9 @@ class Scheduler:
         if gpu:
             job.assigned_gpus = [gpu]
             job.start_time = self.clock.current_time
+            delay = math.floor(max(0, job.start_time - job.arrival_time))
+            if delay > 0:
+                self.current_inference_delays.append(delay)
             gpu.assign_llm_task(job)
             self.running_jobs.append(job)
             return True
@@ -357,6 +376,7 @@ class Scheduler:
             return
 
         self.clock.current_time = effective_start_time
+        self.next_delay_log_time = ( (effective_start_time // self.delay_log_interval) + 1 ) * self.delay_log_interval
         self.jobs_to_retry = deque()
 
         while self.pending_jobs or self.running_jobs or self.jobs_to_retry:
@@ -366,8 +386,18 @@ class Scheduler:
             
             self.clock.tick()
 
+            # Tick down GPU lifecycle timers
+            for gpu in self.cluster.gpus:
+                if gpu.is_llm_server:
+                    gpu.update_lifecycle(self.clock.tick_duration)
+
             if self.clock.current_time > 0:
                 
+                # Log inference delays
+                if self.clock.current_time >= self.next_delay_log_time:
+                    self._log_average_inference_delay()
+                    self.next_delay_log_time += self.delay_log_interval
+
                 # Log GPU usage
                 if self.clock.current_time % self.log_interval == 0:
                     self._log_gpu_usage()
@@ -415,9 +445,23 @@ class Scheduler:
                 self._handle_job_completion(job)
 
 
+    def _log_average_inference_delay(self):
+        if not self.current_inference_delays:
+            avg_delay = 0
+            job_count = 0
+        else:
+            avg_delay = sum(self.current_inference_delays) / len(self.current_inference_delays)
+            job_count = len(self.current_inference_delays)
+
+        log_entry = f"{self.clock.current_time},{avg_delay:.2f},{job_count}\n"
+        self.inference_delay_log_file.write(log_entry)
+        self.current_inference_delays = []
+
     def print_results(self):
         """Prints a final summary and saves it to simulation_summary.txt."""
+        self._log_average_inference_delay()
         self.training_log_file.close()
+        self.inference_delay_log_file.close()
         self.usage_log_file.close()
 
         with open("simulation_summary.txt", "w") as summary_file:
