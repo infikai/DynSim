@@ -75,7 +75,7 @@ if __name__ == "__main__":
     parser.add_argument("csv_file", type=str, help="Path to training workload CSV")
     parser.add_argument("--llm-trace", type=str, help="Path to LLM inference trace CSV")
     parser.add_argument("--baseline-log", type=str, help="Path to Proposed training_jobs.csv for deadline constraints")
-    parser.add_argument("--total-gpus", type=int, default=1350, help="Total GPU count")
+    parser.add_argument("--total-gpus", type=int, default=1100, help="Total GPU count")
     parser.add_argument("--progress-interval", type=int, default=1000, help="Ticks between progress prints")
     parser.add_argument("--log-interval", type=int, default=100, help="Ticks between usage logs")
     parser.add_argument("--start-time", type=int, default=0, help="Simulation start timestamp")
@@ -85,8 +85,8 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     # Calculate GPU split
-    num_training = 650
-    num_inference = 650
+    num_training = 470
+    num_inference = 630
     
     print(f"Initializing cluster: {num_training} training GPUs, {num_inference} inference GPUs (Total: {args.total_gpus})")
     cluster = ClusterManager(num_training_gpus=num_training, num_inference_gpus=num_inference)
